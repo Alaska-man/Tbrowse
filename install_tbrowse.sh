@@ -55,8 +55,8 @@ pip_install "urllib3<2"
 pip_install requests
 pip_install beautifulsoup4
 pip_install html2text
-pip_install "googlesearch-python"   # real Google search results
-pip_install ddgs                    # DuckDuckGo fallback (renamed from duckduckgo-search)
+pip_install "googlesearch-python"   # real Google results + AI Overview scraping
+pip_install ddgs                    # DuckDuckGo fallback
 success "Dependencies ready"
 
 # ── Source file ───────────────────────────────────────────────
@@ -99,10 +99,11 @@ echo -e "${GREEN}${BOLD}  ✓ Done! Open a new terminal (or run: source ${SHELL_
 echo ""
 echo -e "${BOLD}  Usage:${RESET}"
 echo -e "${DIM}    tbrowse                          # Open browser${RESET}"
-echo -e "${DIM}    tbrowse \"search query\"           # Search Google${RESET}"
+echo -e "${DIM}    tbrowse \"search query\"           # Search Google + AI Overview${RESET}"
 echo -e "${DIM}    tbrowse https://example.com      # Open URL${RESET}"
 echo ""
 echo -e "${BOLD}  Keys:${RESET}"
 echo -e "${DIM}    j/k or ↑↓ = scroll   Tab/n = next link   Enter = open link${RESET}"
 echo -e "${DIM}    o = edit URL bar     b = back   h = history   q = quit${RESET}"
+echo -e "${DIM}    a = toggle AI Overview on/off    r = reload${RESET}"
 echo ""
