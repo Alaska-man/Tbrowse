@@ -50,10 +50,14 @@ done
 
 if [ -n "$PYTHON" ]; then
   echo ""
-  read -rp "  Remove Python packages (ddgs, html2text, beautifulsoup4)? [y/N]: " CONFIRM
+  read -rp "  Remove Python packages (googlesearch-python, ddgs, html2text, beautifulsoup4, requests, urllib3)? [y/N]: " CONFIRM
   if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-    $PYTHON -m pip uninstall -y ddgs html2text beautifulsoup4 2>/dev/null \
-      || $PYTHON -m pip uninstall -y --break-system-packages ddgs html2text beautifulsoup4 2>/dev/null \
+    $PYTHON -m pip uninstall -y \
+        googlesearch-python ddgs duckduckgo-search \
+        html2text beautifulsoup4 requests urllib3 2>/dev/null \
+      || $PYTHON -m pip uninstall -y --break-system-packages \
+        googlesearch-python ddgs duckduckgo-search \
+        html2text beautifulsoup4 requests urllib3 2>/dev/null \
       || true
     success "Packages removed"
   fi
