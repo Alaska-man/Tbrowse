@@ -21,6 +21,7 @@ Keys:
   b             Go back
   h             View history
   r             Reload page
+  a             Toggle AI Overview on/off
   q             Quit
 """
 from __future__ import annotations
@@ -59,10 +60,8 @@ _install("beautifulsoup4", "bs4")
 _install("html2text",      "html2text")
 
 # ── Search engine setup ───────────────────────────────────────────────────────
-# Priority: googlesearch-python (scrapes Google) → ddgs → duckduckgo-search
 _search_engine = None
 
-# Try googlesearch-python first (real Google results)
 for _pkg, _mod in [("googlesearch-python", "googlesearch")]:
     if _ensure(_pkg, _mod):
         _search_engine = "google"
@@ -80,7 +79,6 @@ if _search_engine is None:
         if _search_engine:
             break
 
-# Fall back to ddgs / duckduckgo-search
 if _search_engine is None:
     for _pkg, _mod in [("ddgs", "ddgs"), ("duckduckgo-search", "duckduckgo_search")]:
         if _ensure(_pkg, _mod):
@@ -115,12 +113,14 @@ import html2text as h2t
 # ── HTTP fetch ────────────────────────────────────────────────────────────────
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
 }
 
 def fetch(url: str) -> Tuple[Optional[str], str]:
@@ -141,45 +141,130 @@ def fetch(url: str) -> Tuple[Optional[str], str]:
     except Exception as e:
         return None, str(e)
 
-# ── Google search (scrapes Google via googlesearch-python) ───────────────────
-def _google_search(query: str, num: int = 20) -> List[dict]:
+# ── AI Overview extractor ─────────────────────────────────────────────────────
+def _extract_ai_overview(html: str) -> Optional[str]:
     """
-    Returns list of dicts with keys: title, href, body.
-    Uses googlesearch-python which scrapes real Google SERPs.
-    Falls back to fetching Google's result page for snippets.
+    Try to extract the Google AI Overview (SGE) block from a raw Google SERP HTML.
+    Returns a plain-text summary string, or None if not found.
+    """
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strategy 1: look for the AI overview container by known data attributes / class patterns
+    # Google uses several different class names and data tags over time — we try them all
+    candidate_selectors = [
+        # AI Overview block (2024+)
+        "div[data-attrid='wa:/description']",
+        "div[jsname='yEVEwb']",
+        "div[jsname='Cpkphb']",
+        "div[data-content-feature='1']",
+        # Featured snippet (fallback – still very useful)
+        "div.LGOjhe",
+        "div.yDYNvb",
+        "div[data-tts='answers']",
+        "block-component",
+        "div.wDYxhc",           # knowledge panel summary
+        "div.kno-rdesc span",   # knowledge panel description
+        "div.ifM9O",            # AI overview wrapper (newer)
+        "div.cLjAic",
+        "div.fm06If",
+    ]
+
+    for sel in candidate_selectors:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(" ", strip=True)
+            if len(text) > 60:
+                return _clean_ai_text(text)
+
+    # Strategy 2: look for any block that carries "AI Overview" as a heading sibling
+    for tag in soup.find_all(["h2", "h3", "span", "div"]):
+        t = tag.get_text(" ", strip=True).lower()
+        if "ai overview" in t or "ai-powered overview" in t:
+            # grab the next substantial sibling or parent's text
+            parent = tag.find_parent()
+            if parent:
+                text = parent.get_text(" ", strip=True)
+                if len(text) > 80:
+                    return _clean_ai_text(text)
+
+    # Strategy 3: look inside <script type="application/ld+json"> for description
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            import json
+            data = json.loads(script.string or "")
+            desc = None
+            if isinstance(data, dict):
+                desc = data.get("description") or data.get("abstract")
+            if desc and len(desc) > 60:
+                return _clean_ai_text(desc)
+        except Exception:
+            pass
+
+    return None
+
+
+def _clean_ai_text(text: str) -> str:
+    """Normalize whitespace and remove boilerplate phrases from AI overview text."""
+    text = re.sub(r"\s+", " ", text).strip()
+    # Strip common leading junk
+    for prefix in ["AI Overview", "AI-powered overview", "Overview", "Summary"]:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].lstrip(" :–—")
+    # Remove trailing "More about …" type cruft
+    text = re.sub(r"\s*(More about|Learn more|See more|Source[s]?).*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ── Google search ─────────────────────────────────────────────────────────────
+def _google_search(query: str, num: int = 20) -> Tuple[List[dict], Optional[str]]:
+    """
+    Returns (results_list, ai_overview_text_or_None).
     """
     from googlesearch import search as gsearch
     results = []
     seen = set()
+    ai_overview = None
+
+    # First: scrape Google HTML for AI Overview + featured snippets
+    raw_html, _ = fetch(f"https://www.google.com/search?q={quote_plus(query)}&num={num}&hl=en")
+    if raw_html:
+        ai_overview = _extract_ai_overview(raw_html)
+        # Also pull organic results from the HTML as a reliable fallback
+        html_results = _google_html_parse(raw_html, num)
+        for r in html_results:
+            if r["href"] not in seen:
+                seen.add(r["href"])
+                results.append(r)
+
+    # Also try the library for any additional results / enrichment
     try:
-        # googlesearch-python yields URLs; we enrich with titles/snippets
-        urls = list(gsearch(query, num_results=num, sleep_interval=0.5, advanced=True))
-        for item in urls:
+        items = list(gsearch(query, num_results=num, sleep_interval=0.3, advanced=True))
+        for item in items:
             if hasattr(item, "url"):
-                url = item.url
+                url   = item.url
                 title = getattr(item, "title", "") or url
-                body = getattr(item, "description", "") or ""
+                body  = getattr(item, "description", "") or ""
             else:
-                url = str(item)
+                url   = str(item)
                 title = url
-                body = ""
+                body  = ""
             if url and url not in seen:
                 seen.add(url)
                 results.append({"title": title, "href": url, "body": body})
     except Exception:
-        # Fallback: fetch Google HTML directly
-        results = _google_html_fallback(query, num)
-    return results
+        pass  # we already have HTML results
 
-def _google_html_fallback(query: str, num: int = 20) -> List[dict]:
-    """Scrape Google search result page as a fallback."""
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num={num}"
-    html, _ = fetch(url)
-    if not html:
-        return []
+    return results, ai_overview
+
+
+def _google_html_parse(html: str, num: int = 20) -> List[dict]:
+    """Parse organic search results from a raw Google SERP page."""
     soup = BeautifulSoup(html, "html.parser")
     results = []
-    for g in soup.select("div.g, div[data-hveid]")[:num]:
+    for g in soup.select("div.g, div[data-hveid]")[:num * 2]:
         a = g.find("a", href=True)
         if not a:
             continue
@@ -190,31 +275,37 @@ def _google_html_fallback(query: str, num: int = 20) -> List[dict]:
             continue
         title_el = g.find("h3")
         title = title_el.get_text(" ", strip=True) if title_el else href
-        snippet_el = g.select_one("div.VwiC3b, span.aCOpRe, div[data-sncf]")
+        snippet_el = g.select_one("div.VwiC3b, span.aCOpRe, div[data-sncf], div.s3v9rd")
         body = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-        results.append({"title": title, "href": href, "body": body})
+        if title and href:
+            results.append({"title": title, "href": href, "body": body})
+        if len(results) >= num:
+            break
     return results
 
-def _ddgs_search(query: str, num: int = 20) -> List[dict]:
-    """DuckDuckGo search fallback."""
+
+def _ddgs_search(query: str, num: int = 20) -> Tuple[List[dict], None]:
+    """DuckDuckGo search fallback — no AI overview available."""
     try:
         if _search_engine == "ddgs":
             from ddgs import DDGS
         else:
             from duckduckgo_search import DDGS
         with DDGS() as d:
-            return list(d.text(query, max_results=num))
+            return list(d.text(query, max_results=num)), None
     except Exception:
-        return []
+        return [], None
 
-def search(query: str) -> List[dict]:
-    """Dispatch to best available search engine."""
+
+def search(query: str) -> Tuple[List[dict], Optional[str]]:
+    """Dispatch to best available search engine. Returns (results, ai_overview)."""
     if _search_engine == "google":
-        results = _google_search(query)
+        results, ai_ov = _google_search(query)
         if not results:
-            results = _ddgs_search(query)   # cascade if Google blocked
-        return results
+            results, _ = _ddgs_search(query)
+        return results, ai_ov
     return _ddgs_search(query)
+
 
 # ── HTML → plain lines + link map ────────────────────────────────────────────
 def parse_page(html: str, base_url: str) -> Tuple[List[str], List[Tuple[int, str, str]]]:
@@ -296,8 +387,19 @@ def parse_page(html: str, base_url: str) -> Tuple[List[str], List[Tuple[int, str
     return out, links
 
 
-def build_search_page(results: List[dict], query: str, engine: str = "") -> Tuple[List[str], List[Tuple[int, str, str]]]:
-    engine_label = f"Google" if engine == "google" else "DuckDuckGo"
+# ── Search result page builder ────────────────────────────────────────────────
+# Special sentinel used to mark AI overview lines (for colour coding)
+_AI_LINE_PREFIX = "\x01AI\x01"
+_AI_SOURCE_PREFIX = "\x01SRC\x01"
+
+def build_search_page(
+    results: List[dict],
+    query: str,
+    engine: str = "",
+    ai_overview: Optional[str] = None,
+    show_ai: bool = True,
+) -> Tuple[List[str], List[Tuple[int, str, str]]]:
+    engine_label = "Google" if engine == "google" else "DuckDuckGo"
     lines: List[str] = [
         "",
         f"  {engine_label} Search: {query}",
@@ -305,12 +407,32 @@ def build_search_page(results: List[dict], query: str, engine: str = "") -> Tupl
         "",
     ]
     links: List[Tuple[int, str, str]] = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "No title")
-        url   = r.get("href", "")
-        body  = r.get("body", "")
 
-        # Truncate long URLs for display
+    # ── AI Overview block ─────────────────────────────────────────────────────
+    if show_ai and ai_overview:
+        ai_search_url = f"https://www.google.com/search?q={quote_plus(query)}"
+        lines.append(_AI_LINE_PREFIX + "  ✦  AI OVERVIEW")
+        lines.append(_AI_LINE_PREFIX + "  " + "─" * 58)
+        # Word-wrap the overview text
+        for para in ai_overview.split("\n"):
+            para = para.strip()
+            if not para:
+                continue
+            for wl in textwrap.wrap(para, 86) or [""]:
+                lines.append(_AI_LINE_PREFIX + "  " + wl)
+        lines.append(_AI_SOURCE_PREFIX + f"  ↗  View on Google: {ai_search_url}")
+        links.append((len(lines) - 1, "View AI Overview on Google", ai_search_url))
+        lines.append(_AI_LINE_PREFIX + "  " + "─" * 58)
+        lines.append("")
+    elif show_ai and engine == "google":
+        lines.append(_AI_LINE_PREFIX + "  ✦  AI OVERVIEW  (not available for this query)")
+        lines.append("")
+
+    # ── Organic results ───────────────────────────────────────────────────────
+    for i, r in enumerate(results, 1):
+        title       = r.get("title", "No title")
+        url         = r.get("href", "")
+        body        = r.get("body", "")
         display_url = url if len(url) <= 72 else url[:69] + "…"
 
         links.append((len(lines), title, url))
@@ -321,72 +443,62 @@ def build_search_page(results: List[dict], query: str, engine: str = "") -> Tupl
             for wl in textwrap.wrap(body_clean, 86):
                 lines.append(f"       {wl}")
         lines.append("")
+
     return lines, links
 
 
 # ── Curses Browser ────────────────────────────────────────────────────────────
 class Browser:
-    # Row layout:
-    #   0         → URL bar
-    #   1         → status / info bar
-    #   2..rows-2 → content
-    #   rows-1    → help bar / prompt
-
     URL_ROW    = 0
     STATUS_ROW = 1
-    HELP_ROW   = -1   # last row (computed at draw time)
+    HELP_ROW   = -1
 
     def __init__(self, stdscr: curses.window):
         self.scr    = stdscr
-        self.lines: List[str]                              = []
-        self.links: List[Tuple[int, str, str]]             = []
+        self.lines: List[str]                                = []
+        self.links: List[Tuple[int, str, str]]               = []
         self.history: List[Tuple[str, List[str], list, int]] = []
-        self.scroll   = 0
-        self.sel_link = -1
-        self.url      = ""
-        self.status_msg = ""   # transient status message
+        self.scroll      = 0
+        self.sel_link    = -1
+        self.url         = ""
+        self.status_msg  = ""
         self.last_engine = _search_engine
+        # AI overview state
+        self.show_ai        = True
+        self._last_query    = ""
+        self._last_results: List[dict]      = []
+        self._last_ai_ov:   Optional[str]   = None
         self._setup_colors()
 
     def _setup_colors(self):
         curses.start_color()
         curses.use_default_colors()
-        # Pair 1: URL bar                   white on blue
-        curses.init_pair(1, curses.COLOR_WHITE,  curses.COLOR_BLUE)
-        # Pair 2: headings                  yellow bold
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        # Pair 3: link (normal)             cyan
-        curses.init_pair(3, curses.COLOR_CYAN,   -1)
-        # Pair 4: link (selected)           black on green
-        curses.init_pair(4, curses.COLOR_BLACK,  curses.COLOR_GREEN)
-        # Pair 5: dim / quote               white dim
-        curses.init_pair(5, curses.COLOR_WHITE,  -1)
-        # Pair 6: error                     red bold
-        curses.init_pair(6, curses.COLOR_RED,    -1)
-        # Pair 7: input prompt              black on white
-        curses.init_pair(7, curses.COLOR_BLACK,  curses.COLOR_WHITE)
-        # Pair 8: status bar                black on cyan
-        curses.init_pair(8, curses.COLOR_BLACK,  curses.COLOR_CYAN)
-        # Pair 9: URL bar label             yellow on blue
-        curses.init_pair(9, curses.COLOR_YELLOW, curses.COLOR_BLUE)
-        # Pair 10: search result URL        green dim
-        curses.init_pair(10, curses.COLOR_GREEN, -1)
+        curses.init_pair(1,  curses.COLOR_WHITE,  curses.COLOR_BLUE)   # URL bar
+        curses.init_pair(2,  curses.COLOR_YELLOW, -1)                  # headings
+        curses.init_pair(3,  curses.COLOR_CYAN,   -1)                  # link normal
+        curses.init_pair(4,  curses.COLOR_BLACK,  curses.COLOR_GREEN)  # link selected
+        curses.init_pair(5,  curses.COLOR_WHITE,  -1)                  # dim / quote
+        curses.init_pair(6,  curses.COLOR_RED,    -1)                  # error
+        curses.init_pair(7,  curses.COLOR_BLACK,  curses.COLOR_WHITE)  # input prompt
+        curses.init_pair(8,  curses.COLOR_BLACK,  curses.COLOR_CYAN)   # status bar
+        curses.init_pair(9,  curses.COLOR_YELLOW, curses.COLOR_BLUE)   # URL bar label
+        curses.init_pair(10, curses.COLOR_GREEN,  -1)                  # search URL
+        # New: AI Overview colours
+        curses.init_pair(11, curses.COLOR_BLACK,  curses.COLOR_YELLOW) # AI header
+        curses.init_pair(12, curses.COLOR_YELLOW, -1)                  # AI body text
+        curses.init_pair(13, curses.COLOR_GREEN,  -1)                  # AI source link
 
     def _rows(self): return self.scr.getmaxyx()[0]
     def _cols(self): return self.scr.getmaxyx()[1]
-    def _view_h(self): return max(1, self._rows() - 3)   # URL + status + help = 3 rows
+    def _view_h(self): return max(1, self._rows() - 3)
 
     # ── drawing ───────────────────────────────────────────────────────────────
-
     def _draw_urlbar(self):
-        """Row 0: [ tbrowse ] https://... [back N]"""
         cols = self._cols()
-        # Left label
-        label = " ❯ "
+        label       = " ❯ "
         url_display = self.url or "about:blank"
-        # Right side: link count
-        lcount = f" {len(self.links)} links " if self.links else ""
-        avail = cols - len(label) - len(lcount)
+        lcount      = f" {len(self.links)} links " if self.links else ""
+        avail       = cols - len(label) - len(lcount)
         if len(url_display) > avail:
             url_display = "…" + url_display[-(avail - 1):]
         bar = label + url_display.ljust(avail) + lcount
@@ -394,7 +506,6 @@ class Browser:
             self.scr.attron(curses.color_pair(1))
             self.scr.addstr(0, 0, bar[:cols].ljust(cols))
             self.scr.attroff(curses.color_pair(1))
-            # Colour the label differently
             self.scr.attron(curses.color_pair(9) | curses.A_BOLD)
             self.scr.addstr(0, 0, label)
             self.scr.attroff(curses.color_pair(9) | curses.A_BOLD)
@@ -402,7 +513,6 @@ class Browser:
             pass
 
     def _draw_statusbar(self):
-        """Row 1: page info + scroll position."""
         cols = self._cols()
         if self.status_msg:
             msg  = f" {self.status_msg} "
@@ -413,8 +523,10 @@ class Browser:
             pct   = min(pct, 100)
             pos   = f" {self.scroll + 1}-{min(self.scroll + self._view_h(), total)}/{total} ({pct}%) "
             back  = f" ← {len(self.history)} " if self.history else ""
-            title_area = cols - len(pos) - len(back)
-            line  = (back + " " * (title_area - len(back)) + pos)[:cols].ljust(cols)
+            # Show AI status indicator
+            ai_indicator = " [AI✦ON] " if self.show_ai else " [AI✦OFF] "
+            title_area   = cols - len(pos) - len(back) - len(ai_indicator)
+            line = (back + " " * max(0, title_area - len(back)) + ai_indicator + pos)[:cols].ljust(cols)
         try:
             self.scr.attron(curses.color_pair(8))
             self.scr.addstr(1, 0, line[:cols])
@@ -425,7 +537,7 @@ class Browser:
     def _draw_helpbar(self):
         cols = self._cols()
         rows = self._rows()
-        msg  = "  j/k scroll  Tab link  Enter open  o edit URL  b back  h history  r reload  q quit"
+        msg  = "  j/k scroll  Tab link  Enter open  o URL  b back  h hist  a AI-toggle  r reload  q quit"
         try:
             self.scr.attron(curses.color_pair(7))
             self.scr.addstr(rows - 1, 0, msg[:cols].ljust(cols))
@@ -439,8 +551,8 @@ class Browser:
         link_line_map = {li: i for i, (li, _, _) in enumerate(self.links)}
 
         for row in range(view_h):
-            li = self.scroll + row
-            scr_row = row + 2    # offset: URL bar + status bar
+            li      = self.scroll + row
+            scr_row = row + 2
             try:
                 self.scr.move(scr_row, 0)
                 self.scr.clrtoeol()
@@ -449,19 +561,38 @@ class Browser:
             if li >= len(self.lines):
                 continue
 
-            text  = self.lines[li]
-            llink = link_line_map.get(li, -1)
-            is_sel = (llink == self.sel_link and self.sel_link >= 0)
-            s     = text.strip()
+            raw_text = self.lines[li]
+            llink    = link_line_map.get(li, -1)
+            is_sel   = (llink == self.sel_link and self.sel_link >= 0)
+
+            # Determine if this is an AI overview line
+            is_ai_header = raw_text.startswith(_AI_LINE_PREFIX)
+            is_ai_src    = raw_text.startswith(_AI_SOURCE_PREFIX)
+            # Strip prefix for display
+            if is_ai_header:
+                text = raw_text[len(_AI_LINE_PREFIX):]
+            elif is_ai_src:
+                text = raw_text[len(_AI_SOURCE_PREFIX):]
+            else:
+                text = raw_text
+
+            s = text.strip()
 
             if is_sel:
                 attr = curses.color_pair(4) | curses.A_BOLD
+            elif is_ai_src:
+                attr = curses.color_pair(13) | curses.A_UNDERLINE
+            elif is_ai_header:
+                if "AI OVERVIEW" in s.upper() and "✦" in s:
+                    attr = curses.color_pair(11) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(12)
             elif s.isupper() and len(s) > 2 and not s.startswith("["):
                 attr = curses.color_pair(2) | curses.A_BOLD
             elif s.startswith("[") and "]" in s:
                 attr = curses.color_pair(3)
             elif s.startswith("http") and " " not in s:
-                attr = curses.color_pair(10)      # raw URL lines in search results
+                attr = curses.color_pair(10)
             elif s.startswith("│") or s.startswith("•"):
                 attr = curses.color_pair(5)
             else:
@@ -505,24 +636,18 @@ class Browser:
 
     # ── URL bar inline edit ───────────────────────────────────────────────────
     def _edit_urlbar(self, prefill: str = "") -> str:
-        """
-        Turn row 0 into an editable text field.
-        Returns the entered string or "" if cancelled.
-        """
-        cols = self._cols()
-        prompt = " ❯ "
+        cols    = self._cols()
+        prompt  = " ❯ "
         field_w = cols - len(prompt) - 1
-
-        buf = list(prefill or self.url or "")
-        cur = len(buf)
+        buf     = list(prefill or self.url or "")
+        cur     = len(buf)
 
         curses.echo()
         curses.curs_set(1)
 
         def _render():
-            # Slide window so cursor is always visible
-            start = max(0, cur - field_w + 1)
-            view  = buf[start:start + field_w]
+            start    = max(0, cur - field_w + 1)
+            view     = buf[start:start + field_w]
             view_str = "".join(view).ljust(field_w)
             try:
                 self.scr.attron(curses.color_pair(7) | curses.A_BOLD)
@@ -536,7 +661,7 @@ class Browser:
                 pass
             self.scr.refresh()
 
-        curses.noecho()   # manual echo
+        curses.noecho()
         result = None
         try:
             while True:
@@ -545,7 +670,7 @@ class Browser:
                 if ch in (10, 13, curses.KEY_ENTER):
                     result = "".join(buf).strip()
                     break
-                elif ch == 27:          # ESC — cancel
+                elif ch == 27:
                     result = ""
                     break
                 elif ch in (curses.KEY_BACKSPACE, 127, 8):
@@ -606,26 +731,58 @@ class Browser:
             self.history.append((self.url, self.lines[:], self.links[:], self.scroll))
         engine_label = "Google" if _search_engine == "google" else "DuckDuckGo"
         self._loading(f"Searching {engine_label}: {query[:55]}…")
-        results = search(query)
+
+        results, ai_overview = search(query)
+
+        # Cache for AI toggle
+        self._last_query   = query
+        self._last_results = results
+        self._last_ai_ov   = ai_overview
+
         if not results:
-            self.lines = [
-                "", "  No results found.",
-                "", "  Try a different query.",
-            ]
+            self.lines = ["", "  No results found.", "", "  Try a different query."]
             self.links = []
         else:
-            self.lines, self.links = build_search_page(results, query, _search_engine)
-        self.url      = f"search: {query}"
-        self.scroll   = 0
-        self.sel_link = -1
-        self.status_msg = f"{len(results)} results via {engine_label}" if results else ""
+            self.lines, self.links = build_search_page(
+                results, query, _search_engine,
+                ai_overview=ai_overview,
+                show_ai=self.show_ai,
+            )
+        self.url        = f"search: {query}"
+        self.scroll     = 0
+        self.sel_link   = -1
+        ai_note         = " ✦AI" if (ai_overview and self.show_ai) else ""
+        self.status_msg = (
+            f"{len(results)} results via {engine_label}{ai_note}" if results else ""
+        )
+
+    def toggle_ai(self):
+        """Toggle AI overview visibility and re-render the search page."""
+        self.show_ai = not self.show_ai
+        if self._last_query and self._last_results:
+            self.lines, self.links = build_search_page(
+                self._last_results,
+                self._last_query,
+                _search_engine,
+                ai_overview=self._last_ai_ov,
+                show_ai=self.show_ai,
+            )
+            engine_label = "Google" if _search_engine == "google" else "DuckDuckGo"
+            ai_note      = " ✦AI" if (self._last_ai_ov and self.show_ai) else ""
+            self.status_msg = (
+                f"{len(self._last_results)} results via {engine_label}{ai_note}"
+            )
+            self.scroll   = 0
+            self.sel_link = -1
+        else:
+            self.status_msg = f"AI Overview: {'ON' if self.show_ai else 'OFF'}"
 
     def go_back(self):
         if not self.history:
             self.status_msg = "No history"
             return
         self.url, self.lines, self.links, self.scroll = self.history.pop()
-        self.sel_link  = -1
+        self.sel_link   = -1
         self.status_msg = ""
 
     def show_history(self):
@@ -646,7 +803,6 @@ class Browser:
         self.status_msg = ""
 
     def open_prompt(self, prefill: str = ""):
-        """Activate the URL bar for editing."""
         query = self._edit_urlbar(prefill)
         if not query:
             return
@@ -678,10 +834,13 @@ class Browser:
                 "    o  /  /     →  open URL bar (type URL or search query)",
                 "    Tab / n     →  next link",
                 "    Enter       →  follow link",
+                "    a           →  toggle AI Overview on / off",
                 "    b           →  go back",
                 "    h           →  history",
                 "    j / k       →  scroll",
                 "    q           →  quit",
+                "",
+                "  ✦  AI Overviews will appear above search results when available.",
                 "",
             ]
             self.url = "tbrowse — Terminal Browser"
@@ -709,7 +868,7 @@ class Browser:
                 self.scroll = 0
             elif key in (ord("G"), curses.KEY_END):
                 self.scroll_to(len(self.lines))
-            elif key in (9, ord("n"), curses.KEY_RIGHT):      # Tab / n
+            elif key in (9, ord("n"), curses.KEY_RIGHT):
                 self.next_link(1)
             elif key in (ord("N"), curses.KEY_LEFT):
                 self.next_link(-1)
@@ -725,6 +884,8 @@ class Browser:
                 self.go_back()
             elif key == ord("h"):
                 self.show_history()
+            elif key == ord("a"):
+                self.toggle_ai()
             elif key == ord("r"):
                 if self.url and not self.url.startswith("search:"):
                     self.load_url(self.url, push_history=False)
@@ -752,7 +913,7 @@ class Browser:
                     elif bstate & curses.BUTTON5_PRESSED:
                         self.scroll_by(3)
                     elif bstate & curses.BUTTON1_CLICKED:
-                        if my == 0:           # click on URL bar → edit it
+                        if my == 0:
                             self.open_prompt()
                 except curses.error:
                     pass
